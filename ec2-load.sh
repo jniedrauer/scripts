@@ -3,11 +3,11 @@
 set -eu
 
 main() {
-    local filter="${1:-}"
-    [ -n "$filter" ] || print_help "$?"
-    [ "$filter" = '--help' ] && print_help "$?"
+    local filters=("${@}")
+    [ -n "${filters[0]:-}" ] || print_help "$?"
+    [ "${filters[0]:-}" = '--help' ] && print_help "$?"
 
-    local instances=($(filter_instances "$filter"))
+    local instances=($(filters_instances "${filters[@]}"))
     get_output_for_humans "${instances[@]}" | sort -k2,2 -n
 }
 
@@ -22,9 +22,10 @@ get_output_for_humans() {
     done
 }
 
-filter_instances() {
+filters_instances() {
+    local filters=("$@")
     aws ec2 describe-instances \
-        --filter="$filter" \
+        --filters "${filters[@]}" \
         --query='Reservations[*].Instances[*].[InstanceId]' --output=text
 }
 
@@ -45,9 +46,9 @@ get_instance_average() {
 print_help() {
     local exit_status="$1"
     cat <<EOF
-usage: $0 FILTER
+usage: $0 FILTERS
 
-Where FILTER is in AWS filter format.
+Where FILTERS is a list of AWS EC2 filters.
 Example: $0 'Name=tag:Group,Values=groupname'
 EOF
     exit "$exit_status"
