@@ -1,123 +1,111 @@
-#!/usr/bin/env python3
-"""Designed for use in AWS Lambda.
-Snapshot every volume tagged with CREATE_TAG. Delete generated snapshots
-after they are SNAPSHOT_PERIOD + 1 days old."""
+"""Snapshot every volume tagged with BACKUP_TAG. Delete snapshots after they are
+DEFAULT_DAYS days old"""
 
 
+import logging
 import os
 from datetime import datetime, timedelta
+from typing import Dict, List
+
 import boto3
-import botocore
 
 
-SNAPSHOT_PERIOD = 7 # Days
-CREATE_TAG = {'AutoSnapshot': 'true'}
-DELETE_TAG = {'AutoDelete': 'true'}
-RETENTION_TAG = {'AutoDeleteDays': SNAPSHOT_PERIOD}
-SNAPSHOT_DESCRIPTION = 'Automatic daily backup'
-REGION = os.environ.get('AWS_REGION') or 'us-east-1'
+BACKUP_TAG = 'BackupDays'
+DEFAULT_DAYS = '7'
+DEFAULT_NAME = 'Unknown'
+LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO')
+REGION = os.environ['REGION']
+EC2 = boto3.resource('ec2', region_name=REGION)
+
+logging.getLogger().setLevel(getattr(logging, LOG_LEVEL.upper()))
+
+LOG = logging.getLogger(__name__)
 
 
-def tags_to_filter(tags):
-    """Convert a tags dict to AWS filter format"""
-    tag_filter = []
-    for key, value in tags.items():
-        tag_filter.append(
-            {
-                'Name': 'tag:' + key,
-                'Values': [value]
-            }
-        )
-    return tag_filter
+def lambda_handler(*_) -> Dict[str, bool]:
+    """Module entrypoint"""
+    new = [j for i in get_instances() for j in get_snapshots(i)]
+    LOG.info(f'Created: {len(new)} snapshots')
+
+    deleted = [delete_snapshot(i) for i in get_old_snapshots()]
+    LOG.info(f'Deleted: {len(deleted)} snapshots')
+
+    return {'ok': True}
 
 
-def take_snapshot(volume, tags):
-    """Take a snapshot of volume and apply tags. Return snapshot id"""
-    snapshot = volume.create_snapshot(Description=SNAPSHOT_DESCRIPTION)
+def get_instances() -> List[object]:
+    """Get instances to back up"""
+    return EC2.instances.filter(
+        Filters=[dict(
+            Name=f'tag:{BACKUP_TAG}',
+            Values=['*'],
+        )],
+    )
+
+
+def get_snapshots(instance: object) -> List[object]:
+    """Given an instance, get snapshots of all the EBS volumes"""
+    attributes = get_instance_attributes(instance)
+    tags = {
+        'InstanceId': instance.id,
+        'InstanceName': attributes.get('Name', DEFAULT_NAME),
+        BACKUP_TAG: attributes.get('Period', DEFAULT_DAYS),
+    }
+
+    return [get_snapshot(volume, tags) for volume in instance.volumes.all()]
+
+
+def get_snapshot(volume: object, tags: Dict[str, str]) -> str:
+    """Take a snapshot of volume"""
+    mountpoints = dict(
+        Mountpoints=','.join([i.get('Device') for i in volume.attachments])
+    )
+    tags = {**tags, **mountpoints}
+    snapshot = volume.create_snapshot(Description='Lambda backup')
     snapshot.create_tags(
         Tags=[
             {'Key': str(key), 'Value': str(value)} for key, value in tags.items()
         ]
     )
-    return (snapshot.snapshot_id, volume.id)
+    return snapshot.snapshot_id
 
 
-def get_instances(ec2):
-    """Get a list of instances to snapshot volumes from"""
-    tag_filter = tags_to_filter(CREATE_TAG)
-    return ec2.instances.filter(Filters=tag_filter)
-
-
-def get_instance_name(instance):
-    """Given an instance, get the tag Value for Key 'Name'"""
+def get_instance_attributes(instance: object) -> Dict[str, str]:
+    """Get instances name from tags"""
+    result = {}
     for tag in instance.tags:
-        if tag.get('Key') == 'Name':
-            return tag.get('Value')
+        if tag['Key'] == 'Name':
+            result['Name'] = tag['Value']
+        elif tag['Key'] == BACKUP_TAG:
+            result['Period'] = tag['Value']
+
+    return result
 
 
-def take_snapshots(ec2):
-    """Create snapshots of the tagged instances"""
-    snaps_created = 0
-    tagged_instances = get_instances(ec2)
-    for instance in tagged_instances:
-        for volume in instance.volumes.all():
-            result = take_snapshot(
-                volume,
-                {
-                    **DELETE_TAG,
-                    **RETENTION_TAG,
-                    'InstanceId': instance.id,
-                    'InstanceName': get_instance_name(instance) or 'Unknown',
-                    'MountPoints': ', '.join([i.get('Device') for i in volume.attachments])
-                }
-            )
-            print('Created snashot %s of volume %s' % result)
-            snaps_created += 1
-    return snaps_created
-
-
-def get_timezone_aware_offset(offset, tzinfo):
+def get_offset(offset: str, tzinfo) -> datetime:
     """Get a timezone aware offset from current time"""
     now = datetime.now(tzinfo)
-    return now - timedelta(days=offset+1)
+    return now - timedelta(days=int(offset))
 
 
-def get_snapshot_retention(tags):
-    """Iterate through tags and return retention period"""
-    for tag in tags:
-        if tag.get('Key') == 'AutoDeleteDays':
-            return tag.get('Value')
+def delete_snapshot(snapshot: object) -> bool:
+    """Delete snapshot. Return success/failure"""
+    snapshot.delete()
+    return True
 
 
-def delete_snapshots(ec2):
-    """Clean up snapshots older than current - SNAPSHOT_PERIOD"""
-    snaps_deleted = 0
-    tag_filter = tags_to_filter(DELETE_TAG)
-
-    snapshots = ec2.snapshots.filter(Filters=tag_filter)
-
+def get_old_snapshots() -> List[object]:
+    """Get a list of expired snapshots"""
+    snapshots = EC2.snapshots.filter(
+        Filters=[dict(
+            Name=f'tag:{BACKUP_TAG}',
+            Values=['*'],
+        )],
+    )
+    result = []
     for snapshot in snapshots:
-        try:
-            retention = int(get_snapshot_retention(snapshot.tags))
-        except ValueError:
-            print('Invalid retention specified on %s, skipped' % snapshot.id)
-            continue
-        if snapshot.start_time < get_timezone_aware_offset(retention, snapshot.start_time.tzinfo):
-            print('Deleting snapshot: %s' % snapshot.id)
-            try:
-                snapshot.delete()
-            except botocore.exceptions.ClientError as e:
-                print('Failed to delete %s: %s' % (snapshot.id, e.response))
-                continue
-            snaps_deleted += 1
-    return snaps_deleted
+        retention = [i['Value'] for i in snapshot.tags if i['Key'] == BACKUP_TAG][0]
+        if snapshot.start_time < get_offset(retention, snapshot.start_time.tzinfo):
+            result.append(snapshot)
 
-
-def lambda_handler(*_):
-    """Main function"""
-    ec2 = boto3.resource('ec2', region_name=REGION)
-
-    snaps_created = take_snapshots(ec2)
-    snaps_deleted = delete_snapshots(ec2)
-
-    return {'SnapshotsCreated': snaps_created, 'SnapshotsDeleted': snaps_deleted}
+    return result
