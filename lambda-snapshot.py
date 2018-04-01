@@ -24,7 +24,7 @@ LOG = logging.getLogger(__name__)
 
 def lambda_handler(*_) -> Dict[str, bool]:
     """Module entrypoint"""
-    new = [j for i in get_instances() for j in get_snapshots(i)]
+    new = [j for i in get_instances() for j in create_snapshots(i)]
     LOG.info(f'Created: {len(new)} snapshots')
 
     deleted = [delete_snapshot(i) for i in get_old_snapshots()]
@@ -43,7 +43,7 @@ def get_instances() -> List[object]:
     )
 
 
-def get_snapshots(instance: object) -> List[object]:
+def create_snapshots(instance: object) -> List[object]:
     """Given an instance, get snapshots of all the EBS volumes"""
     attributes = get_instance_attributes(instance)
     tags = {
@@ -52,10 +52,10 @@ def get_snapshots(instance: object) -> List[object]:
         BACKUP_TAG: attributes.get('Period', DEFAULT_DAYS),
     }
 
-    return [get_snapshot(volume, tags) for volume in instance.volumes.all()]
+    return [create_snapshot(volume, tags) for volume in instance.volumes.all()]
 
 
-def get_snapshot(volume: object, tags: Dict[str, str]) -> str:
+def create_snapshot(volume: object, tags: Dict[str, str]) -> str:
     """Take a snapshot of volume"""
     mountpoints = dict(
         Mountpoints=','.join([i.get('Device') for i in volume.attachments])
